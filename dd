@@ -3,7 +3,7 @@ create or replace PACKAGE BODY   staging.PKG_MIG_CUST_ACCT_OBJ_POST
 --  $Id: PKG_MIG_CUST_ACCT_OBJ_POST.pkb 34195 2016-12-28 01:57:10Z e0173727 $
 --  $Revision: 34195 $
 --  $Date: 2016-12-28 07:27:10 +0530 (Wed, 28 Dec 2016) $
---
+--logeshkumar
 --  Created by:  Caian Liu
 --
 /********************************************************************************
