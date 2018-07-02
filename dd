@@ -1,1 +1,900 @@
-sdfsd
+create or replace PACKAGE BODY   staging.PKG_MIG_CUST_ACCT_OBJ_POST
+----------------------------------------------------------------------------
+--  $Id: PKG_MIG_CUST_ACCT_OBJ_POST.pkb 34195 2016-12-28 01:57:10Z e0173727 $
+--  $Revision: 34195 $
+--  $Date: 2016-12-28 07:27:10 +0530 (Wed, 28 Dec 2016) $
+--
+--  Created by:  Caian Liu
+--
+/********************************************************************************
+*   NAME: a new Package body of STAGING.PKG_MIG_CUST_ACCT_OBJ_POST
+*   PURPOPOSE: to populate the asap.party_address, ngmssintegration.cust_acct_ref, and ngmssintegration.object_xref tables
+*              for NGMSS
+*   REVISIONS:
+*   Ver         Date          Author/Modifier    Description
+* **************************************************************************
+*   1.0        10/27/2016    Caian Liu          Wrote the coding to populate cust acct xref/party address, and reset the Based V 1.0
+*
+*/
+AS
+
+PROCEDURE MIG_CUST_ACCT_POST_MAIN(nPrcId IN NUMBER, vLoRowId IN ROWID DEFAULT NULL, vHiRowId IN ROWID DEFAULT NULL)
+/********************************************************************************
+*   NAME: MIG_CUST_ACCT_POST_MAIN
+*   PURPOPOSE: to populate party_address and ngmssintegration.cust_acct_ref tables
+*              for NGMSS Customer Accounts Post Migration
+*   REVISIONS:
+*   Ver         Date         Author/Modifier   Description
+* **************************************************************************
+*   1.0        10/27/2016    Caian Liu         Wrote the coding to populate cust acct xref/party address, and reset the Based V 1.0
+*                                              Added the code to check the time interval based on new request
+*   1.1        11/17/2016    Caian Liu         Added the Optimizer Params for improving the performance
+*   1.2        12/08/2016    Caian Liu         Added the code to populate the Party XREF from the Migration process and to calculate the real loaded records  
+*   1.3        12/27/2016    Caian Liu         Added the distinct to get party cursor for avoiding the failing on duplicating parties
+*/
+IS
+  -- Declare the variables
+  v_Pkg_Name                  CONSTANT VARCHAR2(26)  := 'PKG_MIG_CUST_ACCT_OBJ_POST';
+  v_Stored_Proc_Name          VARCHAR2(80)           := 'LOAD_CUST_ACCT_XREF';
+  v_No_Lookup                 CONSTANT VARCHAR2(9)   := 'NO LOOKUP';
+
+  -- Declare the db links for hWin and hPae
+  v_hWin_Db_Link              CONSTANT VARCHAR2(5)   := 'HWIN';
+  v_hPae_Db_Link              CONSTANT VARCHAR2(5)   := 'HPAE';
+
+  -- Declare the variables for counting
+  n_Legacy_Db_Lk_Count        NUMBER := 0;
+  n_Total_Count               NUMBER := 0;
+  n_Error_Count               NUMBER := 0;
+  n_Target_Count              NUMBER := 0;
+  n_Prc_Start_Tm              NUMBER := DBMS_UTILITY.get_time;
+  n_Prc_Cur_Tm                NUMBER := 0;
+  n_Return_Err_Code           NUMBER := 0; -- from the SP_CUST_ACCT_XREF_SERVICE
+  n_Commit_Size               NUMBER := 4800;
+
+  -- Declare the variables for logging info
+  v_Ngmss_Con_Job_Id        staging.CONV_GLOBAL_VARIABLE.VALUE_TEXT%TYPE := 'MSSNW';
+  n_Run_Date                staging.CONV_GLOBAL_VARIABLE.VALUE_NUMBER%TYPE;
+  v_Action                  VARCHAR2(10) := 'Create';
+  v_Businessentity          VARCHAR2(50) := 'CustAcctReference';
+  v_Entitytype              VARCHAR2(10) := NULL;
+  n_Global_Account_Id       NUMBER(30);
+  v_Local_Account_Id        VARCHAR2(50);
+  v_Legacy_hWin_Name        CONSTANT VARCHAR2(7)  := 'MSShWin';
+  v_Legacy_hPae_Name        CONSTANT VARCHAR2(13) := 'MSSEnterprise';
+  v_Ngmss_Name              CONSTANT VARCHAR2(5)  := 'NGMSS';
+  v_Gen_Obj_Pty_Addr_Case   CONSTANT VARCHAR2(12) := 'PartyAddress'; -- Added for the party address
+  v_Legacy_hWin_Sys_Id      NUMBER := 17;
+  v_Legacy_hPae_Sys_Id      NUMBER := 18;
+  v_Ngmss_Sys_Id            NUMBER := 40;
+  n_Prc_Interval_Start_Tm   NUMBER := DBMS_UTILITY.get_time;
+  dt_Prc_Start_Tm           Date   := SYSDATE;
+  n_Prc_Interval_Tm         NUMBER := 15; -- Minutes
+  n_Default_Thread_Id       NUMBER := 1;
+  
+  n_Global_Object_Id        NUMBER := NULL; -- has to be NULL here
+  v_Local_Object_Id         VARCHAR2(50);
+
+  -- Oracle allows us the create error numbers in the range of -20000 to -20999.
+  -- 10g (11); 11g (47); 12c (51); 8i (3); 9i (3);
+  -- -20101 is previous used exception number
+  n_Gv_Fatal_Exception_Num        NUMBER := -20101;
+  n_Dblk_Missing_Exception_Num    NUMBER := -20104;
+
+  -- Changed the previous used -29999 to -20999 since -29999 is not in the user error range of -20000 to -20999
+  n_Run_Date_Err                  NUMBER := -20999;
+
+  -- Declare the variable and exception objects for the error info
+  v_Err_Desc                      VARCHAR2(500) := NULL;
+
+  -- Define the cursor for getting the cust acct data
+  CURSOR C_GET_CUST_ACCT
+      IS
+        SELECT aca.LEGACY_SOURCE,
+           aca.NEW_CUST_ACCT_NBR,
+           aca.LEGACY_CUST_ACCT_NBR
+        FROM staging.AREF_CUSTOMER_ACCT aca;
+
+  RC_GET_CUST_ACCT C_GET_CUST_ACCT%ROWTYPE;
+  
+  -- Define the cursor fro getting the party data
+  CURSOR C_GET_PARTY_INFO
+      IS
+        SELECT DISTINCT
+           aca.LEGACY_SOURCE,
+           aca.NEW_PARTY_ID,
+           aca.LEGACY_PARTY_ID
+        FROM staging.AREF_CUSTOMER_ACCT aca
+        WHERE aca.LEGACY_PARTY_ID IS NOT NULL 
+            AND aca.NEW_PARTY_ID IS NOT NULL;
+           -- AND aca.ROWID BETWEEN vLoRowId AND vhIRowId;
+   
+  RC_GET_PARTY_INFO C_GET_PARTY_INFO%ROWTYPE; 
+   
+  -- Declare the types for objects
+  t_Requestor                 NGMSSINTEGRATION.BUSSYSTEMTYPE;
+  t_Lgcy_Requestor            NGMSSINTEGRATION.BUSSYSTEMTYPE;
+  tt_Custacctreference        NGMSSINTEGRATION.CUSTACCTREFERENCE_ARRAY;
+  
+  -- Declare the types and initialize the type objects 
+  tt_Interactionconditions    NGMSSINTEGRATION.INTERACTIONCONDITIONS_ARRAY := NGMSSINTEGRATION.INTERACTIONCONDITIONS_ARRAY();
+  tt_ObjectReference          NGMSSINTEGRATION.OBJECTREFERENCE_ARRAY := NGMSSINTEGRATION.OBJECTREFERENCE_ARRAY();
+
+  -- Define the conv conversion error log of row type
+  rcConvConversionErrorLog   STAGING.CONV_CONVERSION_ERROR_LOG%ROWTYPE := NULL;
+
+  -- Declare the cursor for getting the party address data from hWin
+   CURSOR c_get_pty_addr_w
+    IS
+       SELECT DISTINCT
+           scad.STG_STREET_NAME,
+           scad.STG_STREET_SUF,
+           scad.STG_POSTAL_CODE,
+           scad.STG_ADDR_LINE1,
+           scad.STG_ADDR_LINE2,
+           scad.STG_ADDR_LINE3,
+           scad.STG_ADDR_LINE4,
+           scad.STG_LAST_MODIFIED_USERID,
+           scad.STG_LAST_MODIFIED_DATE,
+           scad.STG_ADDRESS_ID,
+           scad.STG_PARTY_ID,
+           scad.STG_PARTY_ADDRESS_SEQ,
+           scad.STG_AGRMNT_FROM_EFFECTIVE_DATE, -- EFFECTIVE_BEGIN_DATE
+           scad.STG_AGRMNT_TO_EFFECTIVE_DATE,   -- EFFECTIVE_END_DATE
+           scad.STG_FLOOR,
+           scad.STG_ROOM,
+           scad.STG_BUILDING,
+           scad.STG_ACTIVE_IND,
+           scad.STG_AUTH_METHOD,   -- SRC_VERIFIED_IND
+           aca.NEW_PARTY_ID,
+           aca.LEGACY_PARTY_ID,
+           acaa.NEW_ADDRESS_ID,
+           acaa.LEGACY_ADDRESS_ID,
+           a.GA_INSTANCE_ID_CITY,
+           a.GA_INSTANCE_ID_STATE_CD,
+           a.GA_INSTANCE_ID_COUNTRY
+  FROM staging.STG_CUSTOMER_ACCT_DETAIL scad,
+       staging.AREF_CUSTOMER_ACCT aca,
+       staging.AREF_CUSTOMER_ACCT_ADDR acaa,
+       asap.ADDRESS a
+  WHERE scad.GEN_OBJECT_CASE = v_Gen_Obj_Pty_Addr_Case
+      AND scad.GEN_SOURCE = v_Legacy_hWin_Name
+      AND scad.STG_CUST_ACCT_NBR = aca.NEW_CUST_ACCT_NBR
+      AND aca.LEGACY_PARTY_ID IS NOT NULL
+      -- AND aca.NEW_PARTY_ID IS NOT NULL -- commented out to catch the error of the Migration Proc
+      AND scad.STG_ADDRESS_ID = acaa.LEGACY_ADDRESS_ID
+      AND acaa.LEGACY_SOURCE = v_Legacy_hWin_Name
+      -- AND acaa.NEW_ADDRESS_ID IS NOT NULL -- commented out to catch the error of the Migration Proc
+      AND acaa.NEW_ADDRESS_ID = a.ADDRESS_ID
+  ORDER by scad.STG_ADDRESS_ID,
+     scad.STG_PARTY_ID,
+     scad.STG_PARTY_ADDRESS_SEQ;
+
+  rc_get_pty_addr_w c_get_pty_addr_w%ROWTYPE;
+
+  -- Declare the cursor for getting the party address data from hPae
+  CURSOR c_get_pty_addr_e
+    IS
+       SELECT DISTINCT
+           scad.STG_STREET_NAME,
+           scad.STG_STREET_SUF,
+           scad.STG_POSTAL_CODE,
+           scad.STG_ADDR_LINE1,
+           scad.STG_ADDR_LINE2,
+           scad.STG_ADDR_LINE3,
+           scad.STG_ADDR_LINE4,
+           scad.STG_LAST_MODIFIED_USERID,
+           scad.STG_LAST_MODIFIED_DATE,
+           scad.STG_ADDRESS_ID,
+           scad.STG_PARTY_ID,
+           scad.STG_PARTY_ADDRESS_SEQ,
+           scad.STG_AGRMNT_FROM_EFFECTIVE_DATE, -- EFFECTIVE_BEGIN_DATE
+           scad.STG_AGRMNT_TO_EFFECTIVE_DATE,   -- EFFECTIVE_END_DATE
+           scad.STG_FLOOR,
+           scad.STG_ROOM,
+           scad.STG_BUILDING,
+           scad.STG_ACTIVE_IND,
+           scad.STG_AUTH_METHOD,     -- SRC_VERIFIED_IND
+           aca.NEW_PARTY_ID,
+           aca.LEGACY_PARTY_ID,
+           acaa.NEW_ADDRESS_ID,
+           acaa.LEGACY_ADDRESS_ID,
+           a.GA_INSTANCE_ID_CITY,
+           a.GA_INSTANCE_ID_STATE_CD,
+           a.GA_INSTANCE_ID_COUNTRY
+  FROM staging.STG_CUSTOMER_ACCT_DETAIL scad,
+       staging.AREF_CUSTOMER_ACCT aca,
+       staging.AREF_CUSTOMER_ACCT_ADDR acaa,
+       asap.ADDRESS a
+  WHERE scad.GEN_OBJECT_CASE = v_Gen_Obj_Pty_Addr_Case
+      AND scad.GEN_SOURCE = v_Legacy_hPae_Name
+      AND scad.STG_CUST_ACCT_NBR = aca.NEW_CUST_ACCT_NBR
+      AND aca.LEGACY_PARTY_ID IS NOT NULL
+      -- AND aca.NEW_PARTY_ID IS NOT NULL -- commented out to catch the error of the Migration Proc
+      AND scad.STG_ADDRESS_ID = acaa.LEGACY_ADDRESS_ID
+      AND acaa.LEGACY_SOURCE = v_Legacy_hPae_Name
+      -- AND acaa.NEW_ADDRESS_ID IS NOT NULL -- commented out to catch the error of the Migration Proc
+      AND acaa.NEW_ADDRESS_ID = a.ADDRESS_ID
+  ORDER by scad.STG_ADDRESS_ID,
+     scad.STG_PARTY_ID,
+     scad.STG_PARTY_ADDRESS_SEQ;
+
+  rc_get_pty_addr_e c_get_pty_addr_e%ROWTYPE;
+
+BEGIN
+  -- Enabled output
+  DBMS_OUTPUT.ENABLE;
+  
+  -- Set the current Optimizer params
+  EXECUTE IMMEDIATE 'ALTER SESSION SET OPTIMIZER_FEATURES_ENABLE=' || '''11.2.0.4''' ;
+  EXECUTE IMMEDIATE 'ALTER SESSION SET OPTIMIZER_MODE=ALL_ROWS'; 
+
+  CASE
+      WHEN nPrcId = 1 THEN
+          v_Stored_Proc_Name := 'LOAD_CUST_ACCT_XREF';
+
+      WHEN nPrcId = 2 THEN
+          v_Stored_Proc_Name := 'LOAD_PARTY_ADDRESS';
+
+          -- Check the db links
+          SELECT COUNT(1)
+            INTO n_Legacy_Db_Lk_Count
+          FROM ALL_DB_LINKS
+          WHERE UPPER(DB_LINK) IN (v_hWin_Db_Link, v_hPae_Db_Link);
+
+          --  If not all of the required db links there, log the error and stop the process
+          IF n_Legacy_Db_Lk_Count != 2 THEN
+                rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+                rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name;
+                rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+                rcConvConversionErrorLog.CLASS_OF_ERROR       := 'missing the db links';
+                rcConvConversionErrorLog.ERROR_LOCATOR_ID     := n_Dblk_Missing_Exception_Num;
+                rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := v_No_Lookup;
+                rcConvConversionErrorLog.ERROR_DESCRIPTION    := 'One or two of the db links: HWIN, HPAE missing in the stage database';
+                rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'check/create the db links: HWIN, HPAE, or both, then run the program again';
+
+                -- Log the error
+                insert_log(rcConvConversionErrorLog,n_Gv_Fatal_Exception_Num);
+                COMMIT; -- Save the error log
+
+                -- Let it fail the process
+                RAISE_APPLICATION_ERROR(n_Gv_Fatal_Exception_Num, n_Dblk_Missing_Exception_Num);
+          END IF;
+       
+      WHEN nPrcId = 3 THEN
+          v_Stored_Proc_Name := 'LOAD_PARTY_XREF';
+          
+      ELSE
+          NULL; -- Default
+  END CASE; 
+ 
+  -- Get the predefined the run date
+  BEGIN
+    SELECT VALUE_NUMBER
+      INTO n_Run_Date
+    FROM staging.CONV_GLOBAL_VARIABLE
+    WHERE LABEL_NAME = 'RUN_DATE';
+
+  EXCEPTION
+    WHEN OTHERS THEN
+        -- Build the object
+        rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+        rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name || vLoRowId;
+        rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+        rcConvConversionErrorLog.CLASS_OF_ERROR       := 'missing global variable: run_date';
+        rcConvConversionErrorLog.ERROR_LOCATOR_ID     := n_Run_Date_Err;
+        rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := v_No_Lookup;
+        rcConvConversionErrorLog.ERROR_DESCRIPTION    := 'Fatal error:' || SUBSTR(SQLERRM, 1, 235);
+        rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'add entry for run_date in conv_global_variable then run the program again';
+
+        -- Log the error
+        insert_log(rcConvConversionErrorLog,n_Gv_Fatal_Exception_Num);
+        COMMIT; -- Save the error log
+
+        -- Let it fail the process
+        RAISE_APPLICATION_ERROR(n_Gv_Fatal_Exception_Num, SQLERRM);
+  END;
+
+  BEGIN
+    -- Log the initial stat info of the process
+    INSERT INTO staging.CONV_STAT_SUMMARY_LOG
+      (
+        PROGRAM_NAME,
+        PROGRAM_FUNCTION,
+        PROGRAM_RUN_DATE,
+        PROGRAM_START_TIME,
+        PROGRAM_END_TIME,
+        SOURCE_RECORD_CNT,
+        ERROR_RECORD_CNT,
+        TARGET_RECORD_CNT
+      )
+     VALUES
+      ( v_Pkg_Name,
+        v_Stored_Proc_Name || vLoRowId,
+        TO_DATE (n_Run_Date, 'YYYYMMDD'),
+        SYSDATE,
+        SYSDATE,
+        n_Total_Count,
+        n_Error_Count,
+        n_Target_Count
+      );
+    COMMIT;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- Format the error msg
+      v_Err_Desc := 'Fatal: unable to insert stat summary for '||
+                    'program name='||v_Pkg_Name||
+                    'program function='|| v_Stored_Proc_Name||
+                    'error='||SQLERRM;
+
+      -- Build the object
+      rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+      rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name || vLoRowId;
+      rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+      rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert CONV_STAT_SUMMARY_LOG Err';
+      rcConvConversionErrorLog.ERROR_LOCATOR_ID     := SQLCODE;
+      rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := v_No_Lookup;
+      rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(v_Err_Desc, 1, 250);
+      rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'check/fix the error then run the program again';
+
+      -- Log the error
+      insert_log(rcConvConversionErrorLog,n_Gv_Fatal_Exception_Num);
+      COMMIT;
+
+      -- Let it fail the process
+      RAISE_APPLICATION_ERROR(n_Gv_Fatal_Exception_Num, SQLERRM);
+  END;
+
+  CASE
+      WHEN nPrcId = 1 THEN
+
+        -- Get the customer account data from the cursor
+        FOR RC_GET_CUST_ACCT IN C_GET_CUST_ACCT LOOP
+
+            BEGIN
+                -- Initial the variables
+                t_Requestor           := NULL;
+                t_Lgcy_Requestor      := NULL;
+                tt_Custacctreference  := NULL;
+
+                -- Count the records processed
+                n_Total_Count         := n_Total_Count + 1;
+
+                -- Get the local account id
+                v_Local_Account_Id    := RC_GET_CUST_ACCT.NEW_CUST_ACCT_NBR;
+
+                -- Get the request bussystem type for NGMSS
+                SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Ngmss_Sys_Id, v_Ngmss_Name)
+                  INTO t_Requestor
+                FROM DUAL;
+
+                -- Get the t_Requestor object per the legacy system
+                CASE
+                  WHEN RC_GET_CUST_ACCT.LEGACY_SOURCE = v_Legacy_hWin_Name THEN
+                    SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Legacy_hWin_Sys_Id, v_Legacy_hWin_Name)
+                      INTO t_Lgcy_Requestor
+                    FROM DUAL;
+
+                  WHEN RC_GET_CUST_ACCT.LEGACY_SOURCE = v_Legacy_hPae_Name THEN
+                      SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Legacy_hPae_Sys_Id, v_Legacy_hPae_Name)
+                       INTO t_Lgcy_Requestor
+                      FROM DUAL;
+                  ELSE
+                    NULL; -- Do nothing
+
+                END CASE;
+
+                -- Retrieve the tt_Custacctreference object (table)
+                SELECT * BULK COLLECT
+                   INTO tt_Custacctreference
+                FROM
+                 ( SELECT NGMSSINTEGRATION.CUSTACCTREFERENCE(RC_GET_CUST_ACCT.LEGACY_CUST_ACCT_NBR,t_Lgcy_Requestor)
+                    FROM DUAL
+                 );
+
+                -- Call the SP_CUST_ACCT_XREF_SERVICE to populate the cust_acct_xref
+                NGMSSINTEGRATION.PKG_CUSTACCT_XREF_MAINTENANCE.SP_CUST_ACCT_XREF_SERVICE(t_Requestor,
+                                                                                         v_Action,
+                                                                                         v_Businessentity,
+                                                                                         v_Entitytype, -- NULL
+                                                                                         n_Global_Account_Id,
+                                                                                         v_Local_Account_Id ,
+                                                                                         tt_Custacctreference,
+                                                                                         tt_Interactionconditions
+                                                                                         );
+
+                -- Check the returned info
+                FOR i IN 1 .. tt_Interactionconditions.COUNT LOOP
+
+                  IF (tt_Interactionconditions(i).code != n_Return_Err_Code) THEN
+                    -- Calculate the total count and the error count
+                    n_Total_Count    :=   n_Total_Count  - 1;
+                    n_Error_Count    :=   n_Error_Count  + 1;
+
+                    -- Build the error object
+                    rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+                    rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name;
+                    rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+                    rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert CUST_ACCT_XREF tbl err';
+                    rcConvConversionErrorLog.ERROR_LOCATOR_ID     := tt_Interactionconditions(i).code;
+                    rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := RC_GET_CUST_ACCT.NEW_CUST_ACCT_NBR;
+                    rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(tt_Interactionconditions(i).code || '.' || tt_Interactionconditions(i)
+                                       .MESSAGE || '.' || tt_Interactionconditions(i).severity, 1, 250);
+                    rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the source data from aref_customer_acct table with the new_cust_acct_nbr: '
+                                       || RC_GET_CUST_ACCT.NEW_CUST_ACCT_NBR || ' and with the legacy source: ' || RC_GET_CUST_ACCT.LEGACY_SOURCE ;
+
+                    -- Log the error
+                    INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+
+                  END IF;
+
+                END LOOP;
+
+                 -- Record the statistics
+        IF round((DBMS_UTILITY.get_time - n_Prc_Interval_Start_Tm)/(100*60), 0) >  n_Prc_Interval_Tm THEN
+
+        -- Do the insert
+        INSERT INTO staging.CONV_PERFORMANCE_DASHBOARD
+          (
+            PROGRAM_NAME,
+            PROGRAM_FUNCTION,
+            PROGRAM_THREAD_ID,
+            PROGRAM_RUN_DATE,
+            PROGRAM_START_TIME,
+            PROGRAM_STATUS_TIME,
+            PROGRAM_RECORDS_PROCESSED,
+            ERROR_RECORD_CNT,
+            TARGET_RECORD_CNT
+          )
+        VALUES (
+          v_Pkg_Name,
+          v_Stored_Proc_Name,
+          n_Default_Thread_Id,
+          TO_DATE (n_Run_Date, 'YYYYMMDD'),
+          dt_Prc_Start_Tm,
+          SYSDATE,
+          DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count), 
+          DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count),
+          DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count) - DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count)         
+        );
+        
+        COMMIT;
+        
+        n_Prc_Interval_Start_Tm := DBMS_UTILITY.get_time;
+
+        END IF;
+          EXCEPTION
+            WHEN OTHERS THEN
+                -- Calculate the total count and the error count
+                n_Total_Count    :=   n_Total_Count  - 1;
+                n_Error_Count    :=   n_Error_Count  + 1;
+
+                -- Build the object
+                rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+                rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name;
+                rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+                rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert CUST_ACCT_XREF tbl err';
+                rcConvConversionErrorLog.ERROR_LOCATOR_ID     := SQLCODE;
+                rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := RC_GET_CUST_ACCT.NEW_CUST_ACCT_NBR;
+                rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(SQLERRM, 1, 250);
+                rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the source data from aref_customer_acct table with the new_cust_acct_nbr: '
+                              || RC_GET_CUST_ACCT.NEW_CUST_ACCT_NBR || ' and with the legacy source: ' || RC_GET_CUST_ACCT.LEGACY_SOURCE ;
+
+                -- Log the error
+                INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+
+          END;
+        END LOOP;
+
+     WHEN nPrcId = 2 THEN
+
+        FOR rc_get_pty_addr_w IN c_get_pty_addr_w LOOP
+
+          -- Count the records processed
+          n_Total_Count         := n_Total_Count + 1;
+
+          -- Loading the data into the asp.PARTY_ADDRESS
+          BEGIN
+            INSERT INTO asap.PARTY_ADDRESS(
+                PARTY_ID,
+                PARTY_ADDRESS_SEQ,
+                EFFECTIVE_BEGIN_DATE,
+                EFFECTIVE_END_DATE,
+                FLOOR,
+                ROOM,
+                ACTIVE_IND,
+                LAST_MODIFIED_USERID,
+                LAST_MODIFIED_DATE,
+                SRC_VERIFIED_IND,
+                BUILDING,
+                STREET_NM,
+                STREET_SUF,
+                ADDRESS_ID,
+                ADDR_LN1,
+                ADDR_LN2,
+                ADDR_LN3,
+                ADDR_LN4,
+                GA_INSTANCE_ID_CITY,
+                GA_INSTANCE_ID_STATE,
+                GA_INSTANCE_ID_COUNTRY,
+                POSTAL_CODE)
+            VALUES(rc_get_pty_addr_w.NEW_PARTY_ID, -- New
+                (SELECT NVL(MAX(pa.PARTY_ADDRESS_SEQ), 0) + 1
+                    FROM asap.PARTY_ADDRESS pa
+                WHERE pa.PARTY_ID  = rc_get_pty_addr_w.NEW_PARTY_ID),
+                rc_get_pty_addr_w.STG_AGRMNT_FROM_EFFECTIVE_DATE,    -- EFFECTIVE_BEGIN_DATE
+                rc_get_pty_addr_w.STG_AGRMNT_TO_EFFECTIVE_DATE,      -- EFFECTIVE_END_DATE
+                rc_get_pty_addr_w.STG_FLOOR,
+                rc_get_pty_addr_w.STG_ROOM,
+                rc_get_pty_addr_w.STG_ACTIVE_IND,
+                rc_get_pty_addr_w.STG_LAST_MODIFIED_USERID,
+                rc_get_pty_addr_w.STG_LAST_MODIFIED_DATE,
+                rc_get_pty_addr_w.STG_AUTH_METHOD, -- SRC_VERIFIED_IND
+                rc_get_pty_addr_w.STG_BUILDING,
+                rc_get_pty_addr_w.STG_STREET_NAME,
+                rc_get_pty_addr_w.STG_STREET_SUF,
+                rc_get_pty_addr_w.NEW_ADDRESS_ID,
+                rc_get_pty_addr_w.STG_ADDR_LINE1,
+                rc_get_pty_addr_w.STG_ADDR_LINE2,
+                rc_get_pty_addr_w.STG_ADDR_LINE3,
+                rc_get_pty_addr_w.STG_ADDR_LINE4,
+                rc_get_pty_addr_w.GA_INSTANCE_ID_CITY,
+                rc_get_pty_addr_w.GA_INSTANCE_ID_STATE_CD,
+                rc_get_pty_addr_w.GA_INSTANCE_ID_COUNTRY,
+                rc_get_pty_addr_w.STG_POSTAL_CODE
+            );
+          EXCEPTION
+            WHEN OTHERS THEN
+              -- Calculate the total count and the error count
+              n_Total_Count    :=   n_Total_Count  - 1;
+              n_Error_Count    :=   n_Error_Count  + 1;
+
+              -- Build the object
+              rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+              rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name;
+              rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+              rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert PARTY_ADDRESS tbl err';
+              rcConvConversionErrorLog.ERROR_LOCATOR_ID     := SQLCODE;
+              rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := rc_get_pty_addr_w.LEGACY_PARTY_ID;
+              rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(SQLERRM, 1, 250);
+              rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the '|| v_Legacy_hWin_Name || ' source data with the new_party_id: ' || rc_get_pty_addr_w.NEW_PARTY_ID
+                            || ', lgcy_party_id: ' || rc_get_pty_addr_w.LEGACY_PARTY_ID  || ', new_addr_id: '
+                            || rc_get_pty_addr_w.NEW_ADDRESS_ID || ', lgcy_addr_id: ' || rc_get_pty_addr_w.LEGACY_ADDRESS_ID;
+
+              -- Log the error
+              INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+          END;
+
+          -- Commit
+          IF  n_Total_Count MOD n_Commit_Size = 0 THEN
+            COMMIT;
+          END IF;
+
+        END LOOP;
+        COMMIT;
+
+        FOR rc_get_pty_addr_e IN c_get_pty_addr_e LOOP
+
+          -- Count the records processed
+          n_Total_Count         := n_Total_Count + 1;
+
+          -- Loading the data into the asp.PARTY_ADDRESS
+          BEGIN
+             INSERT INTO asap.PARTY_ADDRESS(
+                PARTY_ID,
+                PARTY_ADDRESS_SEQ,
+                EFFECTIVE_BEGIN_DATE,
+                EFFECTIVE_END_DATE,
+                FLOOR,
+                ROOM,
+                ACTIVE_IND,
+                LAST_MODIFIED_USERID,
+                LAST_MODIFIED_DATE,
+                SRC_VERIFIED_IND,
+                BUILDING,
+                STREET_NM,
+                STREET_SUF,
+                ADDRESS_ID,
+                ADDR_LN1,
+                ADDR_LN2,
+                ADDR_LN3,
+                ADDR_LN4,
+                GA_INSTANCE_ID_CITY,
+                GA_INSTANCE_ID_STATE,
+                GA_INSTANCE_ID_COUNTRY,
+                POSTAL_CODE)
+            VALUES(rc_get_pty_addr_e.NEW_PARTY_ID, -- New
+                (SELECT NVL(MAX(pa.PARTY_ADDRESS_SEQ), 0) + 1
+                    FROM asap.PARTY_ADDRESS pa
+                WHERE pa.PARTY_ID  = rc_get_pty_addr_e.NEW_PARTY_ID),
+                rc_get_pty_addr_e.STG_AGRMNT_FROM_EFFECTIVE_DATE, -- EFFECTIVE_BEGIN_DATE
+                rc_get_pty_addr_e.STG_AGRMNT_TO_EFFECTIVE_DATE,   -- EFFECTIVE_END_DATE
+                rc_get_pty_addr_e.STG_FLOOR,
+                rc_get_pty_addr_e.STG_ROOM,
+                rc_get_pty_addr_e.STG_ACTIVE_IND,
+                rc_get_pty_addr_e.STG_LAST_MODIFIED_USERID,
+                rc_get_pty_addr_e.STG_LAST_MODIFIED_DATE,
+                rc_get_pty_addr_e.STG_AUTH_METHOD, -- SRC_VERIFIED_IND
+                rc_get_pty_addr_e.STG_BUILDING,
+                rc_get_pty_addr_e.STG_STREET_NAME,
+                rc_get_pty_addr_e.STG_STREET_SUF,
+                rc_get_pty_addr_e.NEW_ADDRESS_ID,
+                rc_get_pty_addr_e.STG_ADDR_LINE1,
+                rc_get_pty_addr_e.STG_ADDR_LINE2,
+                rc_get_pty_addr_e.STG_ADDR_LINE3,
+                rc_get_pty_addr_e.STG_ADDR_LINE4,
+                rc_get_pty_addr_e.GA_INSTANCE_ID_CITY,
+                rc_get_pty_addr_e.GA_INSTANCE_ID_STATE_CD,
+                rc_get_pty_addr_e.GA_INSTANCE_ID_COUNTRY,
+                rc_get_pty_addr_e.STG_POSTAL_CODE
+            );
+          EXCEPTION
+            WHEN OTHERS THEN
+              -- Calculate the total count and the error count
+              n_Total_Count    :=   n_Total_Count  - 1;
+              n_Error_Count    :=   n_Error_Count  + 1;
+
+              -- Build the object
+              rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+              rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name;
+              rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+              rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert PARTY_ADDRESS tbl err';
+              rcConvConversionErrorLog.ERROR_LOCATOR_ID     := SQLCODE;
+              rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := rc_get_pty_addr_e.LEGACY_PARTY_ID;
+              rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(SQLERRM, 1, 250);
+              rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the ' || v_Legacy_hPae_Name || ' source data with the new_party_id: ' || rc_get_pty_addr_e.NEW_PARTY_ID
+                            || ', lgcy_party_id: ' || rc_get_pty_addr_e.LEGACY_PARTY_ID  || ', new_addr_id: '
+                            || rc_get_pty_addr_e.NEW_ADDRESS_ID || ', lgcy_addr_id: ' || rc_get_pty_addr_e.LEGACY_ADDRESS_ID;
+
+              -- Log the error
+              INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+          END;
+
+          -- Commit
+          IF  n_Total_Count MOD n_Commit_Size = 0 THEN
+            COMMIT;
+          END IF;
+
+        END LOOP;
+        COMMIT;
+    
+     WHEN nPrcId = 3 THEN
+
+        -- Get the party info from the cursor
+        FOR RC_GET_PARTY_INFO IN C_GET_PARTY_INFO LOOP
+
+            BEGIN
+                -- Initial the variables
+                t_Requestor           := NULL;
+                t_Lgcy_Requestor      := NULL;
+                tt_ObjectReference    := NULL;
+                v_Businessentity      := 'Party';                
+
+                -- Count the records processed
+                n_Total_Count         := n_Total_Count + 1;
+
+                -- Get the local object id
+                v_Local_Object_Id    := TO_CHAR(RC_GET_PARTY_INFO.NEW_PARTY_ID);
+
+                -- Get the request bussystem type for NGMSS
+                SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Ngmss_Sys_Id, v_Ngmss_Name)
+                  INTO t_Requestor
+                FROM DUAL;
+
+                -- Get the t_Requestor object per the legacy system
+                CASE
+                  WHEN RC_GET_PARTY_INFO.LEGACY_SOURCE = v_Legacy_hWin_Name THEN
+                    SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Legacy_hWin_Sys_Id, v_Legacy_hWin_Name)
+                      INTO t_Lgcy_Requestor
+                    FROM DUAL;
+
+                  WHEN RC_GET_PARTY_INFO.LEGACY_SOURCE = v_Legacy_hPae_Name THEN
+                      SELECT NGMSSINTEGRATION.BUSSYSTEMTYPE(v_Legacy_hPae_Sys_Id, v_Legacy_hPae_Name)
+                       INTO t_Lgcy_Requestor
+                      FROM DUAL;
+                  ELSE
+                    NULL; -- Do nothing
+
+                END CASE;
+
+                -- Retrieve the tt_ObjectReference object (table)
+                SELECT * BULK COLLECT
+                   INTO tt_ObjectReference
+                FROM
+                 ( SELECT NGMSSINTEGRATION.OBJECTREFERENCE(RC_GET_PARTY_INFO.LEGACY_PARTY_ID,t_Lgcy_Requestor)
+                    FROM DUAL
+                 );
+
+                -- Call the SP_OBJECT_XREF_SERVICE to populate the party xref info                
+                NGMSSINTEGRATION.PKG_OBJECT_XREF_MAINTENANCE.SP_LOAD_OBJECT_XREF_SERVICE(t_Requestor,
+                                                                                   v_Action,
+                                                                                   v_Businessentity,
+                                                                                   v_Entitytype, -- NULL
+                                                                                   n_Global_Account_Id,
+                                                                                   v_Local_Object_Id,
+                                                                                   tt_ObjectReference,
+                                                                                   tt_Interactionconditions);
+                                                                                    
+                
+                -- Check the returned info
+                FOR i IN 1 .. tt_Interactionconditions.COUNT LOOP
+                         
+                  IF (tt_Interactionconditions(i).code != n_Return_Err_Code) THEN
+                    -- Calculate the total count and the error count
+                    n_Total_Count    :=   n_Total_Count  - 1;
+                    n_Error_Count    :=   n_Error_Count  + 1;
+
+                    -- Build the error object
+                    rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+                    rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name || vLoRowId;
+                    rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+                    rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert Party Object XREF err';
+                    rcConvConversionErrorLog.ERROR_LOCATOR_ID     := tt_Interactionconditions(i).code;
+                    rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := RC_GET_PARTY_INFO.NEW_PARTY_ID;
+                    rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(tt_Interactionconditions(i).code || '.' || tt_Interactionconditions(i)
+                                       .MESSAGE || '.' || tt_Interactionconditions(i).severity, 1, 250);
+                    rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the source data from aref_customer_acct table with the legacy_party_id: '
+                                       || RC_GET_PARTY_INFO.LEGACY_PARTY_ID || ' and with the legacy source: ' || RC_GET_PARTY_INFO.LEGACY_SOURCE ;
+
+                    -- Log the error
+                    INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+
+                  END IF;
+
+                END LOOP;
+
+                 -- Record the statistics
+                IF round((DBMS_UTILITY.get_time - n_Prc_Interval_Start_Tm)/(100*60), 0) >  n_Prc_Interval_Tm THEN
+
+                  -- Do the insert
+                  INSERT INTO staging.CONV_PERFORMANCE_DASHBOARD
+                    (
+                      PROGRAM_NAME,
+                      PROGRAM_FUNCTION,
+                      PROGRAM_THREAD_ID,
+                      PROGRAM_RUN_DATE,
+                      PROGRAM_START_TIME,
+                      PROGRAM_STATUS_TIME,
+                      PROGRAM_RECORDS_PROCESSED,
+                      ERROR_RECORD_CNT,
+                      TARGET_RECORD_CNT
+                    )
+                  VALUES (
+                    v_Pkg_Name,
+                    v_Stored_Proc_Name || vLoRowId,
+                    n_Default_Thread_Id,
+                    TO_DATE (n_Run_Date, 'YYYYMMDD'),
+                    dt_Prc_Start_Tm,
+                    SYSDATE,
+                    DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count), 
+                    DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count),
+                    DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count) - DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count)                   
+                  );
+                  
+                  COMMIT;
+                  
+                  n_Prc_Interval_Start_Tm := DBMS_UTILITY.get_time;
+
+                END IF;
+                
+          EXCEPTION
+            WHEN OTHERS THEN
+                -- Calculate the total count and the error count
+                n_Total_Count    :=   n_Total_Count  - 1;
+                n_Error_Count    :=   n_Error_Count  + 1;
+
+                -- Build the object
+                rcConvConversionErrorLog.PROGRAM_NAME         := v_Pkg_Name;
+                rcConvConversionErrorLog.PROGRAM_FUNCTION     := v_Stored_Proc_Name || vLoRowId;
+                rcConvConversionErrorLog.PROGRAM_RUN_DATE     := SYSDATE;
+                rcConvConversionErrorLog.CLASS_OF_ERROR       := 'Insert Party Object XREF err';
+                rcConvConversionErrorLog.ERROR_LOCATOR_ID     := SQLCODE;
+                rcConvConversionErrorLog.SRC_DATA_KEY_LOOKUP  := RC_GET_PARTY_INFO.NEW_PARTY_ID;
+                rcConvConversionErrorLog.ERROR_DESCRIPTION    := SUBSTR(SQLERRM, 1, 250);
+                rcConvConversionErrorLog.RESOLUTION_REQUIRED  := 'Check/fix the source data from aref_customer_acct table the legacy_party_id: '
+                         || RC_GET_PARTY_INFO.LEGACY_PARTY_ID || ' and with the legacy source: ' || RC_GET_PARTY_INFO.LEGACY_SOURCE ;
+
+                -- Log the error
+                INSERT INTO staging.conv_conversion_error_log VALUES rcConvConversionErrorLog;
+
+          END;
+          
+        END LOOP;
+        
+    ELSE
+      NULL; -- Do nothing
+
+  END CASE;
+
+  -- Update/log the final stat info of the process
+  n_Target_Count := n_total_count + n_error_count;
+  UPDATE staging.conv_stat_summary_log
+     SET program_end_time   = SYSDATE,
+         source_record_cnt  = DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count),
+         error_record_cnt   = DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count),
+         target_record_cnt  = DECODE(nPrcId, 1, n_Target_Count*2, 3, n_Target_Count*2,n_Target_Count)
+  WHERE program_name  = v_Pkg_Name
+      AND program_function  = v_Stored_Proc_Name || vLoRowId
+      AND program_run_date  = to_date(n_run_date,'YYYYMMDD');
+
+  COMMIT;
+  
+   -- Do the insert
+  INSERT INTO staging.CONV_PERFORMANCE_DASHBOARD
+    (
+      PROGRAM_NAME,
+      PROGRAM_FUNCTION,
+      PROGRAM_THREAD_ID,
+      PROGRAM_RUN_DATE,
+      PROGRAM_START_TIME,
+      PROGRAM_STATUS_TIME,
+      PROGRAM_RECORDS_PROCESSED,
+      ERROR_RECORD_CNT,
+      TARGET_RECORD_CNT
+    )
+  VALUES (
+    v_Pkg_Name,
+    v_Stored_Proc_Name || vLoRowId,
+    n_Default_Thread_Id,
+    TO_DATE (n_Run_Date, 'YYYYMMDD'),
+    dt_Prc_Start_Tm,
+    SYSDATE,
+    DECODE(nPrcId, 1, n_Total_Count*2, 3, n_Total_Count*2,n_Total_Count),
+    DECODE(nPrcId, 1, n_Error_Count*2, 3, n_Error_Count*2,n_Error_Count),
+    DECODE(nPrcId, 1, n_Target_Count*2, 3, n_Target_Count*2,n_Target_Count)
+  );
+  COMMIT;
+
+  -- Output of the process completed info for tracing
+  CASE
+
+    WHEN nPrcId = 1 THEN
+      DBMS_OUTPUT.put_line('(1): Completely processed the customer account data as ' ||n_total_count || ' of records with ' || n_error_count || ' error record(s) at ' || TO_CHAR(SYSDATE, 'yyyy-mm-dd HH:MI:SS'));
+      DBMS_OUTPUT.put_line('(2): Loaded the data into the Customer Account Xref table as ' ||n_total_count*2 || ' of records with ' || n_error_count*2 || ' error record(s) at ' || TO_CHAR(SYSDATE, 'yyyy-mm-dd HH:MI:SS'));
+      DBMS_OUTPUT.put_line('(3): Took ' || round((DBMS_UTILITY.get_time - n_Prc_Start_Tm)/(100*60), 0) || ' minute(s) for completely processing and loading '
+          || 'Aref Customer Account Info into the Customer Account Xref table...');
+
+    WHEN nPrcId = 2 THEN
+      DBMS_OUTPUT.put_line('(1): Completely processed the customer account data as ' ||n_total_count || ' of records with ' || n_error_count || ' error record(s) at ' || TO_CHAR(SYSDATE, 'yyyy-mm-dd HH:MI:SS'));
+      DBMS_OUTPUT.put_line('(2): Took ' || round((DBMS_UTILITY.get_time - n_Prc_Start_Tm)/(100*60), 0) || ' minute(s) for completely processing and loading '
+          || 'PARTY ADDRESS Info into the PARTY_ADDRESS table...');
+          
+    WHEN nPrcId = 3 THEN
+      DBMS_OUTPUT.put_line('(1): Completely processed the customer account data as ' ||n_total_count || ' of records with ' || n_error_count || ' error record(s) at ' || TO_CHAR(SYSDATE, 'yyyy-mm-dd HH:MI:SS'));
+      DBMS_OUTPUT.put_line('(2): Loaded the data into the Party Object Xref table as ' ||n_total_count*2 || ' of records with ' || n_error_count*2 || ' error record(s) at ' || TO_CHAR(SYSDATE, 'yyyy-mm-dd HH:MI:SS'));
+      DBMS_OUTPUT.put_line('(3): Took ' || round((DBMS_UTILITY.get_time - n_Prc_Start_Tm)/(100*60), 0) || ' minute(s) for completely processing and loading '
+          || 'Party Info into the Party Object Xref table...');
+          
+    ELSE
+      NULL;
+
+  END CASE;
+EXCEPTION
+	WHEN OTHERS THEN
+    -- Let the process fail
+    RAISE_APPLICATION_ERROR(n_Gv_Fatal_Exception_Num, SQLERRM);
+
+END; -- End of the Main Stored Proc
+
+-- Log the error info into the STAGING.CONV_CONVERSION_ERROR_LOG table
+PROCEDURE insert_log(rcConvConversionErrorLog IN STAGING.CONV_CONVERSION_ERROR_LOG%ROWTYPE,
+                    nFatalExceptionNum IN NUMBER)
+IS
+    v_Err_Msg         VARCHAR2(1000) := NULL;
+BEGIN
+     /*
+      program_name, program_function, program_run_date, class_of_error, error_locator_id,
+      src_data_key_lookup, error_description, resolution_required
+     */
+     INSERT INTO staging.conv_conversion_error_log
+        VALUES rcConvConversionErrorLog;
+
+     -- COMMIT;
+
+
+END;
+
+END PKG_MIG_CUST_ACCT_OBJ_POST; -- End of package
+/
+
