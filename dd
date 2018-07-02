@@ -892,13 +892,7 @@ BEGIN
 
      -- COMMIT;
 
-EXCEPTION
-    WHEN OTHERS THEN
-        v_Err_Msg:= 'FATAL: unable to insert log for '|| 'program_name='||rcConvConversionErrorLog.program_name
-          || 'program_function='||rcConvConversionErrorLog.program_function
-          || 'error_message='||rcConvConversionErrorLog.error_description;
 
-        RAISE_APPLICATION_ERROR(nFatalExceptionNum, v_Err_Msg);
 
 END;
 

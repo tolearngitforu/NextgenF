@@ -1,0 +1,20 @@
+select * from serv_req_si@hwin 
+where document_number = 20347764 
+and item_alias IN ('Internet', 'Physical Connection', 'Video');
+
+select * from serv_item@hwin 
+where serv_item_id in (70370336,70370337,70370338);
+
+select * from nst_con_type_srsi@hwin 
+where document_number = 20347764;
+
+
+select * from ns_connection@hwin where CIRCUIT_DESIGN_ID = 54496461;
+
+/
+
+update asap.serv_req_gateway_event@hwin 
+set GATEWAY_EVENT_STATUS_CD = 'S' 
+where document_number = --20956324 
+and task_number = --87857895 
+and gateway_event_id = 1429; 
