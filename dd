@@ -893,8 +893,8 @@ BEGIN
      -- COMMIT;
 
 
+
 END;
 
 END PKG_MIG_CUST_ACCT_OBJ_POST; -- End of package
 /
-
